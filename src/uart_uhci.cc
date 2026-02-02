@@ -32,7 +32,14 @@ static const char* kTag = "UartUhci";
 static bool IRAM_ATTR gdma_rx_callback_wrapper(gdma_channel_handle_t dma_chan, gdma_event_data_t* event_data, void* user_data) {
     (void)dma_chan;
     auto* self = static_cast<UartUhci*>(user_data);
-    return self->HandleGdmaRxDone(event_data->flags.normal_eof);
+    return self->HandleGdmaRxDone(event_data->rx_eof_desc_addr, event_data->flags.normal_eof);
+}
+
+static bool IRAM_ATTR gdma_rx_descr_err_wrapper(gdma_channel_handle_t dma_chan, gdma_event_data_t* event_data, void* user_data) {
+    (void)dma_chan;
+    (void)event_data;
+    auto* self = static_cast<UartUhci*>(user_data);
+    return self->HandleGdmaDescrErr();
 }
 
 // Platform singleton for UHCI controller management
@@ -94,8 +101,7 @@ esp_err_t UartUhci::Init(const Config& config) {
     }
 
     // Enable idle EOF mode - triggers callback when UART line becomes idle
-    // 启用 idle EOF 模式 - 当 UART 线路空闲时触发回调
-        uhci_ll_rx_set_eof_mode(uhci_dev_, UHCI_RX_IDLE_EOF);
+    uhci_ll_rx_set_eof_mode(uhci_dev_, UHCI_RX_IDLE_EOF);
 
     // Create PM lock
 #if CONFIG_PM_ENABLE
@@ -176,16 +182,27 @@ esp_err_t UartUhci::InitGdma(const Config& config) {
     // Get RX alignment constraints
     gdma_get_alignment_constraints(rx_dma_chan_, &rx_int_mem_align_, &rx_ext_mem_align_);
 
-    // Create RX DMA link list with buffer pool size
-    // Each buffer gets one DMA node
+    // Create RX DMA link list with buffer pool size and owner checking enabled
+    // Each buffer gets one DMA node, owner mechanism manages buffer availability
     gdma_link_list_config_t rx_link_cfg = {};
     rx_link_cfg.item_alignment = 4;
     rx_link_cfg.num_items = config.rx_pool.buffer_count;
     ESP_RETURN_ON_ERROR(gdma_new_link_list(&rx_link_cfg, &rx_dma_link_), kTag, "RX link list failed");
 
-    // Register RX callback - use recv_done for each node completion
+    // Save link list head address
+    rx_dma_link_head_addr_ = gdma_link_get_head_addr(rx_dma_link_);
+
+    // Enable owner check on DMA channel
+    gdma_strategy_config_t strategy = {};
+    strategy.owner_check = true;
+    ESP_RETURN_ON_ERROR(gdma_apply_strategy(rx_dma_chan_, &strategy), kTag, "DMA strategy failed");
+
+    // Register RX callbacks
+    // - on_recv_done: triggers for each completed descriptor with EOF
+    // - on_descr_err: triggers when DMA encounters descriptor error (e.g., owner check failed)
     gdma_rx_event_callbacks_t rx_cbs = {};
     rx_cbs.on_recv_done = gdma_rx_callback_wrapper;
+    rx_cbs.on_descr_err = gdma_rx_descr_err_wrapper;
     ESP_RETURN_ON_ERROR(gdma_register_rx_event_callbacks(rx_dma_chan_, &rx_cbs, this), kTag, "RX callback failed");
 
     return ESP_OK;
@@ -220,19 +237,7 @@ esp_err_t UartUhci::InitRxBufferPool(const BufferPoolConfig& config) {
     rx_buffer_pool_ = static_cast<RxBuffer*>(heap_caps_calloc(rx_pool_size_, sizeof(RxBuffer), MALLOC_CAP_INTERNAL));
     ESP_RETURN_ON_FALSE(rx_buffer_pool_, ESP_ERR_NO_MEM, kTag, "failed to allocate buffer pool descriptors");
 
-    // Create free buffer queue
-    rx_free_queue_ = xQueueCreateWithCaps(rx_pool_size_, sizeof(uint32_t), MALLOC_CAP_INTERNAL);
-    ESP_RETURN_ON_FALSE(rx_free_queue_, ESP_ERR_NO_MEM, kTag, "failed to create free buffer queue");
-
-    // Allocate mounted buffer index tracking array
-    rx_mounted_idx_ = static_cast<int32_t*>(heap_caps_calloc(rx_pool_size_, sizeof(int32_t), MALLOC_CAP_INTERNAL));
-    ESP_RETURN_ON_FALSE(rx_mounted_idx_, ESP_ERR_NO_MEM, kTag, "failed to allocate mounted index array");
-    for (size_t i = 0; i < rx_pool_size_; i++) {
-        rx_mounted_idx_[i] = -1;  // No buffer mounted
-    }
-    rx_mounted_count_ = 0;
-
-    // Allocate individual buffers and add to free queue
+    // Allocate individual buffers (buffer[i] will be mounted to DMA node[i])
     for (size_t i = 0; i < rx_pool_size_; i++) {
         rx_buffer_pool_[i].data = static_cast<uint8_t*>(
             heap_caps_aligned_alloc(max_align, aligned_size, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL));
@@ -242,10 +247,6 @@ esp_err_t UartUhci::InitRxBufferPool(const BufferPoolConfig& config) {
         rx_buffer_pool_[i].capacity = aligned_size;
         rx_buffer_pool_[i].size = 0;
         rx_buffer_pool_[i].index = i;
-
-        // Add to free queue
-        uint32_t idx = i;
-        xQueueSend(rx_free_queue_, &idx, 0);
     }
 
     ESP_LOGD(kTag, "RX buffer pool: %d buffers x %d bytes (aligned to %d)", 
@@ -265,19 +266,8 @@ void UartUhci::DeinitRxBufferPool() {
         rx_buffer_pool_ = nullptr;
     }
 
-    if (rx_mounted_idx_) {
-        heap_caps_free(rx_mounted_idx_);
-        rx_mounted_idx_ = nullptr;
-    }
-
-    if (rx_free_queue_) {
-        vQueueDeleteWithCaps(rx_free_queue_);
-        rx_free_queue_ = nullptr;
-    }
-
     rx_pool_size_ = 0;
     rx_buffer_size_ = 0;
-    rx_mounted_count_ = 0;
 }
 
 void UartUhci::SetRxCallback(RxCallback callback, void* user_data) {
@@ -285,63 +275,60 @@ void UartUhci::SetRxCallback(RxCallback callback, void* user_data) {
     rx_callback_user_data_ = user_data;
 }
 
+void UartUhci::SetOverflowCallback(OverflowCallback callback, void* user_data) {
+    overflow_callback_ = callback;
+    overflow_callback_user_data_ = user_data;
+}
+
+void UartUhci::RemountAndRestartDma(bool flush_uart_fifo) {
+    // Re-mount all buffers to DMA link list and restart
+    // This is used both for initial start and recovery from overflow
+    
+    // Optionally flush UART RX FIFO to discard stale/incomplete data
+    // This is important after overflow recovery to avoid processing corrupted data
+    if (flush_uart_fifo) {
+        uart_dev_t *hw = UART_LL_GET_HW(uart_port_);
+        uart_ll_rxfifo_rst(hw);
+    }
+    
+    std::vector<gdma_buffer_mount_config_t> mount_configs(rx_pool_size_);
+    for (size_t i = 0; i < rx_pool_size_; i++) {
+        RxBuffer* buf = &rx_buffer_pool_[i];
+        buf->size = 0;
+
+        mount_configs[i].buffer = buf->data;
+        mount_configs[i].length = buf->capacity;
+        mount_configs[i].flags.mark_eof = 1;    // Trigger callback when this buffer is filled
+        mount_configs[i].flags.mark_final = 0;  // Continue to next buffer (circular)
+    }
+
+    last_rx_buf_idx_ = -1;  // Reset buffer sequence tracking
+
+    // Mount all buffers and start DMA
+    // Owner is set to DMA for all nodes by gdma_link_mount_buffers
+    gdma_link_mount_buffers(rx_dma_link_, 0, mount_configs.data(), rx_pool_size_, nullptr);
+    
+    gdma_reset(rx_dma_chan_);
+    gdma_start(rx_dma_chan_, rx_dma_link_head_addr_);
+}
+
 esp_err_t UartUhci::StartReceive() {
     ESP_RETURN_ON_FALSE(!rx_running_.load(), ESP_ERR_INVALID_STATE, kTag, "RX already running");
     ESP_RETURN_ON_FALSE(rx_buffer_pool_, ESP_ERR_INVALID_STATE, kTag, "buffer pool not initialized");
-
-    // Only mount half of the buffers, keep the rest in free queue for replacement
-    // This ensures we always have buffers available when receiving data
-    size_t max_mount = (rx_pool_size_ + 1) / 2;  // Mount at most half (rounded up)
-    if (max_mount < 2) max_mount = 2;
-    
-    size_t mounted = 0;
-    std::vector<gdma_buffer_mount_config_t> mount_configs(rx_pool_size_);
-    memset(mount_configs.data(), 0, mount_configs.size() * sizeof(gdma_buffer_mount_config_t));
-
-    // Clear mounted tracking
-    for (size_t i = 0; i < rx_pool_size_; i++) {
-        rx_mounted_idx_[i] = -1;
-    }
-
-    for (size_t i = 0; i < max_mount; i++) {
-        uint32_t idx;
-        if (xQueueReceive(rx_free_queue_, &idx, 0) != pdTRUE) {
-            break;  // No more free buffers
-        }
-
-        RxBuffer* buf = &rx_buffer_pool_[idx];
-        buf->size = 0;
-
-        mount_configs[mounted].buffer = buf->data;
-        mount_configs[mounted].length = buf->capacity;
-        
-        // Track which buffer is mounted at this DMA node
-        rx_mounted_idx_[mounted] = idx;
-        mounted++;
-    }
-
-    ESP_RETURN_ON_FALSE(mounted >= 2, ESP_ERR_INVALID_STATE, kTag, 
-                        "need at least 2 free buffers to start");
-
-    rx_mounted_count_ = mounted;
-    
-    ESP_LOGD(kTag, "StartReceive: mounted %d buffers, %d in free queue", 
-             mounted, uxQueueMessagesWaiting(rx_free_queue_));
+    ESP_RETURN_ON_FALSE(rx_pool_size_ >= 2, ESP_ERR_INVALID_STATE, kTag, "need at least 2 buffers");
 
     // Acquire PM lock
     if (pm_lock_) {
         esp_pm_lock_acquire(pm_lock_);
     }
 
-    rx_active_node_ = 0;
     rx_running_.store(true);
+    buffer_overflow_.store(false);  // Clear overflow flag
 
-    // Mount buffers and start circular DMA
-    gdma_link_mount_buffers(rx_dma_link_, 0, mount_configs.data(), mounted, nullptr);
-    gdma_reset(rx_dma_chan_);
-    gdma_start(rx_dma_chan_, gdma_link_get_head_addr(rx_dma_link_));
+    // Mount all buffers and start DMA
+    RemountAndRestartDma();
 
-    ESP_LOGD(kTag, "RX started with %d buffers", mounted);
+    ESP_LOGD(kTag, "RX started with %d buffers", rx_pool_size_);
     return ESP_OK;
 }
 
@@ -361,16 +348,7 @@ esp_err_t UartUhci::StopReceive() {
         esp_pm_lock_release(pm_lock_);
     }
 
-    // Return all mounted buffers back to free queue
-    for (size_t i = 0; i < rx_pool_size_; i++) {
-        if (rx_mounted_idx_[i] >= 0) {
-            uint32_t idx = rx_mounted_idx_[i];
-            xQueueSend(rx_free_queue_, &idx, 0);
-            rx_mounted_idx_[i] = -1;
-        }
-    }
-    rx_mounted_count_ = 0;
-
+    // All buffers are now available (no queue operations needed)
     ESP_LOGD(kTag, "RX stopped");
     return ESP_OK;
 }
@@ -381,16 +359,37 @@ void UartUhci::ReturnBuffer(RxBuffer* buffer) {
     }
 
     buffer->size = 0;
-    uint32_t idx = buffer->index;
     
-    // Return to free queue
-    BaseType_t ret = xQueueSend(rx_free_queue_, &idx, 0);
-    if (ret != pdTRUE) {
-        ESP_LOGW(kTag, "Failed to return buffer %lu to free queue", idx);
+    // Set the corresponding DMA node owner back to DMA
+    gdma_link_set_owner(rx_dma_link_, buffer->index, GDMA_LLI_OWNER_DMA);
+    
+    // Resume DMA if it was paused waiting for available buffers
+    if (rx_running_.load()) {
+        if (buffer_overflow_.load()) {
+            // In overflow state - check if ALL buffers are now returned before resuming
+            bool all_returned = true;
+            for (size_t i = 0; i < rx_pool_size_; i++) {
+                gdma_lli_owner_t owner;
+                if (gdma_link_get_owner(rx_dma_link_, i, &owner) == ESP_OK && owner == GDMA_LLI_OWNER_CPU) {
+                    all_returned = false;
+                    break;
+                }
+            }
+            
+            if (all_returned) {
+                // All buffers returned, safe to resume DMA
+                buffer_overflow_.store(false);
+                
+                // Re-mount all buffers and restart DMA
+                // Flush UART FIFO to discard stale/incomplete data from overflow period
+                RemountAndRestartDma(true);
+            }
+            // If not all returned, don't call gdma_append - wait for more buffers
+        } else {
+            // Normal operation - just append to resume DMA
+            gdma_append(rx_dma_chan_);
+        }
     }
-
-    // If RX is running and we have a free buffer, try to add it to DMA
-    // This is handled in the ISR when needed
 }
 
 esp_err_t UartUhci::Transmit(const uint8_t* buffer, size_t size) {
@@ -431,111 +430,128 @@ esp_err_t UartUhci::Transmit(const uint8_t* buffer, size_t size) {
     return ESP_OK;
 }
 
-bool UartUhci::HandleGdmaRxDone(bool is_eof) {
-    bool need_yield = false;
-    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
-
+bool UartUhci::HandleGdmaRxDone(uintptr_t desc_addr, bool is_normal_eof) {
     if (!rx_running_.load()) {
         return false;
     }
 
-    // Get the DMA node that just completed
-    size_t node_idx = rx_active_node_;
+    // In UHCI idle EOF mode, multiple buffers may complete nearly simultaneously
+    // but only one callback may be triggered. We need to check ALL buffers
+    // and process any that have owner=CPU (completed by DMA).
     
-    // Get the buffer index mounted at this node
-    int32_t buf_idx = rx_mounted_idx_[node_idx];
-    if (buf_idx < 0) {
-        // No buffer mounted at this node, restart DMA if EOF
-        if (is_eof) {
-            rx_active_node_ = 0;
-            gdma_reset(rx_dma_chan_);
-            gdma_start(rx_dma_chan_, gdma_link_get_head_addr(rx_dma_link_));
+    // Track maximum CPU-owned buffers for debugging
+    static int max_cpu_owned = 0;
+    int cpu_owned = 0;
+    for (size_t i = 0; i < rx_pool_size_; i++) {
+        gdma_lli_owner_t owner;
+        if (gdma_link_get_owner(rx_dma_link_, i, &owner) == ESP_OK && owner == GDMA_LLI_OWNER_CPU) {
+            cpu_owned++;
         }
-        return false;
     }
-
-    RxBuffer* buf = &rx_buffer_pool_[buf_idx];
-
-    // Get received size - count from this node to EOF marker
-    size_t rx_size = gdma_link_count_buffer_size_till_eof(rx_dma_link_, node_idx);
+    if (cpu_owned > max_cpu_owned) {
+        max_cpu_owned = cpu_owned;
+        ESP_DRAM_LOGI(kTag, "New max CPU-owned buffers: %d/%d", max_cpu_owned, rx_pool_size_);
+    }
     
-    // Sanity check: size should not exceed buffer capacity and should be > 0
-    if (rx_size == 0 || rx_size > buf->capacity) {
-        // No valid data or invalid size, skip processing but still manage buffer
-        rx_mounted_idx_[node_idx] = -1;
-        uint32_t idx = buf->index;
-        xQueueSendFromISR(rx_free_queue_, &idx, &xHigherPriorityTaskWoken);
+    bool need_yield = false;
+    
+    // Process all completed buffers in order, starting from expected next buffer
+    int start_idx = (last_rx_buf_idx_ + 1) % rx_pool_size_;
+    
+    for (size_t count = 0; count < rx_pool_size_; count++) {
+        int buf_idx = (start_idx + count) % rx_pool_size_;
         
-        if (is_eof) {
-            rx_active_node_ = 0;
-            gdma_reset(rx_dma_chan_);
-            gdma_start(rx_dma_chan_, gdma_link_get_head_addr(rx_dma_link_));
+        // Check if this buffer has been completed by DMA (owner = CPU)
+        gdma_lli_owner_t owner;
+        if (gdma_link_get_owner(rx_dma_link_, buf_idx, &owner) != ESP_OK) {
+            continue;
         }
-        return xHigherPriorityTaskWoken == pdTRUE;
-    }
-    buf->size = rx_size;
+        
+        if (owner != GDMA_LLI_OWNER_CPU) {
+            // Buffer not completed yet, stop scanning
+            // (DMA processes buffers in order, so if this one isn't done, 
+            // later ones won't be either)
+            break;
+        }
+        
+        RxBuffer* buf = &rx_buffer_pool_[buf_idx];
+        
+        // Get received size from the DMA descriptor
+        size_t rx_size = gdma_link_get_length(rx_dma_link_, buf_idx);
+        
+        // Sanity check
+        if (rx_size == 0 || rx_size > buf->capacity) {
+            // Invalid size, set owner back to DMA and continue
+            ESP_DRAM_LOGW(kTag, "buf[%d] invalid rx_size=%u (last=%d, start=%d)", 
+                          buf_idx, rx_size, last_rx_buf_idx_, start_idx);
+            gdma_link_set_owner(rx_dma_link_, buf_idx, GDMA_LLI_OWNER_DMA);
+            gdma_append(rx_dma_chan_);
+            last_rx_buf_idx_ = buf_idx;
+            continue;
+        }
+        
+        buf->size = rx_size;
 
         // Sync cache if needed
-    if (rx_cache_line_ > 0 && rx_size > 0) {
-        size_t sync_size = ALIGN_UP(rx_size, rx_cache_line_);
-        esp_cache_msync(buf->data, sync_size, ESP_CACHE_MSYNC_FLAG_DIR_M2C);
-    }
-
-    // Mark this node as no longer having a buffer (will be replaced or left empty)
-    rx_mounted_idx_[node_idx] = -1;
-
-    // Move to next node (circular within mounted count)
-    rx_active_node_ = (rx_active_node_ + 1) % rx_mounted_count_;
-
-    // Try to get a free buffer to replace the one we're about to deliver
-    uint32_t free_idx;
-    if (xQueueReceiveFromISR(rx_free_queue_, &free_idx, &xHigherPriorityTaskWoken) == pdTRUE) {
-        // Mount the new buffer at the completed node position
-        RxBuffer* new_buf = &rx_buffer_pool_[free_idx];
-        new_buf->size = 0;
-
-        gdma_buffer_mount_config_t mount = {};
-        mount.buffer = new_buf->data;
-        mount.length = new_buf->capacity;
-        
-        // Mount at the position of the completed buffer
-        gdma_link_mount_buffers(rx_dma_link_, node_idx, &mount, 1, nullptr);
-        
-        // Track the new buffer at this node
-        rx_mounted_idx_[node_idx] = free_idx;
-
-        if (xHigherPriorityTaskWoken) {
-            need_yield = true;
+        if (rx_cache_line_ > 0) {
+            size_t sync_size = ALIGN_UP(rx_size, rx_cache_line_);
+            esp_cache_msync(buf->data, sync_size, ESP_CACHE_MSYNC_FLAG_DIR_M2C);
         }
-    } else {
-        // No free buffer available - this is a problem!
-        // The DMA node will have no buffer until one is returned
-        ESP_DRAM_LOGE(kTag, "No free buffer for DMA node %d!", node_idx);
-    }
 
-    // User callback to deliver the completed buffer
-    if (rx_callback_ && rx_size > 0) {
+        // Update last processed buffer index
+        last_rx_buf_idx_ = buf_idx;
+
+        // Deliver buffer to user via callback
+        if (rx_callback_) {
             RxEventData data = {
-            .buffer = buf,
+                .buffer = buf,
                 .recv_size = rx_size,
             };
             if (rx_callback_(data, rx_callback_user_data_)) {
                 need_yield = true;
             }
-    } else if (rx_size == 0) {
-        // Empty buffer, return it immediately
-        uint32_t idx = buf->index;
-        xQueueSendFromISR(rx_free_queue_, &idx, &xHigherPriorityTaskWoken);
-        if (xHigherPriorityTaskWoken) {
-            need_yield = true;
+        } else {
+            // No callback registered, return buffer immediately
+            gdma_link_set_owner(rx_dma_link_, buf_idx, GDMA_LLI_OWNER_DMA);
         }
     }
 
-    // If EOF (idle detected), restart DMA from beginning to continue receiving
-    if (is_eof) {
-        rx_active_node_ = 0;
-        gdma_reset(rx_dma_chan_);
-        gdma_start(rx_dma_chan_, gdma_link_get_head_addr(rx_dma_link_));
+    return need_yield;
+}
+
+bool UartUhci::HandleGdmaDescrErr() {
+    if (!rx_running_.load()) {
+        return false;
+    }
+
+    // Only process if not already in overflow state (avoid repeated triggers)
+    bool expected = false;
+    if (!buffer_overflow_.compare_exchange_strong(expected, true)) {
+        // Already in overflow state, ignore repeated triggers
+        return false;
+    }
+
+    // Count how many buffers are owned by CPU (exhausted)
+    int cpu_owned = 0;
+    for (size_t i = 0; i < rx_pool_size_; i++) {
+        gdma_lli_owner_t owner;
+        if (gdma_link_get_owner(rx_dma_link_, i, &owner) == ESP_OK && owner == GDMA_LLI_OWNER_CPU) {
+            cpu_owned++;
+        }
+    }
+
+    // Log warning: DMA stopped due to buffer exhaustion (owner check failed)
+    // This happens when all buffers are held by CPU and DMA has no buffer to write to
+    ESP_DRAM_LOGW(kTag, "GDMA descr_err: buffer exhaustion, %d/%d buffers held by CPU. "
+                  "DMA paused until buffers are returned.", cpu_owned, rx_pool_size_);
+
+    // Don't call gdma_append here - it will be called in ReturnBuffer when buffers are freed
+    // Calling it here would cause repeated descr_err triggers since no buffers are available
+
+    // Notify upper layer via callback (only once)
+    bool need_yield = false;
+    if (overflow_callback_) {
+        need_yield = overflow_callback_(overflow_callback_user_data_);
     }
 
     return need_yield;

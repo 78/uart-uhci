@@ -4,9 +4,9 @@
  * 自定义 UHCI DMA 控制器，提供启动/停止 DMA 接收的功能，
  * 以支持低功耗模式下释放 PM 锁。
  * 
- * 支持两种接收模式：
- * 1. 单缓冲区模式（原有）：调用者提供单个缓冲区，接收完成后停止
- * 2. 缓冲区池模式（新增）：使用预分配的缓冲区池持续接收，通过回调通知
+ * 使用 GDMA owner 机制实现动态缓冲区管理：
+ * - 每个缓冲区接收满时触发回调
+ * - 用户返还缓冲区后自动加回 DMA 链表
  */
 
 #pragma once
@@ -20,7 +20,6 @@
 #include "esp_attr.h"
 #include "hal/uart_types.h"
 #include "freertos/FreeRTOS.h"
-#include "freertos/queue.h"
 
 // Forward declarations for ESP-IDF internal types
 typedef struct gdma_channel_t *gdma_channel_handle_t;
@@ -49,6 +48,10 @@ public:
     // 回调类型（返回 true 表示需要调度，在 ISR 上下文中调用）
     // Note: These are function pointers, not std::function, for ISR safety
     using RxCallback = bool(*)(const RxEventData& data, void* user_data);
+    
+    // Overflow callback - called when DMA stops due to buffer exhaustion
+    // 溢出回调 - 当 DMA 因缓冲区耗尽而停止时调用
+    using OverflowCallback = bool(*)(void* user_data);
 
     // Buffer pool configuration
     // 缓冲区池配置
@@ -79,6 +82,10 @@ public:
     // Register callbacks (must be called before StartReceive)
     // 注册回调（必须在 StartReceive 之前调用）
     void SetRxCallback(RxCallback callback, void* user_data);
+    
+    // Register overflow callback (called when DMA stops due to buffer exhaustion)
+    // 注册溢出回调（当 DMA 因缓冲区耗尽而停止时调用）
+    void SetOverflowCallback(OverflowCallback callback, void* user_data);
 
     // Start continuous DMA receive using buffer pool
     // Acquires PM lock to prevent light sleep
@@ -102,6 +109,16 @@ public:
     // 检查 RX 是否正在运行
     bool IsReceiving() const { return rx_running_.load(); }
 
+    // Check and clear buffer overflow flag (DMA stopped due to buffer exhaustion)
+    // 检查并清除缓冲区溢出标志（DMA 因缓冲区耗尽而停止）
+    bool CheckAndClearOverflow() {
+        return buffer_overflow_.exchange(false);
+    }
+    
+    // Check if overflow occurred (without clearing)
+    // 检查是否发生溢出（不清除）
+    bool HasOverflow() const { return buffer_overflow_.load(); }
+
     // Transmit data (blocking until FIFO is written)
     // 通过 FIFO 发送数据（同步阻塞）
     esp_err_t Transmit(const uint8_t* buffer, size_t size);
@@ -114,10 +131,19 @@ private:
     // Initialize RX buffer pool
     esp_err_t InitRxBufferPool(const BufferPoolConfig& config);
     void DeinitRxBufferPool();
+    
+    // Re-mount all buffers and restart DMA (used for initial start and overflow recovery)
+    // flush_uart_fifo: if true, flush UART RX FIFO before restarting (for overflow recovery)
+    void RemountAndRestartDma(bool flush_uart_fifo = false);
 
 public:
-    // Handle GDMA callbacks
-    bool IRAM_ATTR HandleGdmaRxDone(bool is_eof);
+    // Handle GDMA RX done callback (called from ISR)
+    // desc_addr: completed descriptor address, is_normal_eof: normal EOF flag
+    bool IRAM_ATTR HandleGdmaRxDone(uintptr_t desc_addr, bool is_normal_eof);
+    
+    // Handle GDMA descriptor error callback (called from ISR)
+    // Triggered when DMA encounters descriptor error, e.g., owner check failed (buffer exhaustion)
+    bool IRAM_ATTR HandleGdmaDescrErr();
 
 private:
 
@@ -129,20 +155,18 @@ private:
     // TX direction (Synchronous FIFO mode)
     // No queues needed as it's now blocking and called from a dedicated task
 
-    // RX direction - buffer pool mode (Still uses GDMA)
+    // RX direction - uses GDMA owner mechanism for dynamic buffer management
     gdma_channel_handle_t rx_dma_chan_{nullptr};
     gdma_link_list_handle_t rx_dma_link_{nullptr};
     RxBuffer* rx_buffer_pool_{nullptr};     // Array of buffer descriptors
     size_t rx_pool_size_{0};                // Number of buffers in pool
     size_t rx_buffer_size_{0};              // Size of each buffer
-    QueueHandle_t rx_free_queue_{nullptr};  // Queue of free buffer indices
-    int32_t* rx_mounted_idx_{nullptr};      // Buffer index mounted at each DMA node (-1 = none)
-    size_t rx_mounted_count_{0};            // Number of buffers currently mounted
-    size_t rx_active_node_{0};              // Current active DMA node index
+    uintptr_t rx_dma_link_head_addr_{0};    // DMA link list head address
     size_t rx_cache_line_{0};
     size_t rx_int_mem_align_{0};
     size_t rx_ext_mem_align_{0};
     std::atomic<bool> rx_running_{false};
+    std::atomic<bool> buffer_overflow_{false};  // Set when DMA stops due to buffer exhaustion
 
     // PM lock
     esp_pm_lock_handle_t pm_lock_{nullptr};
@@ -154,6 +178,11 @@ private:
     // Callbacks
     RxCallback rx_callback_{nullptr};
     void* rx_callback_user_data_{nullptr};
+    OverflowCallback overflow_callback_{nullptr};
+    void* overflow_callback_user_data_{nullptr};
+    
+    // Last processed buffer index for in-order processing
+    int last_rx_buf_idx_{-1};
 
     // Delete copy/move
     UartUhci(const UartUhci&) = delete;
