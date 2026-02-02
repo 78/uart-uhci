@@ -299,7 +299,6 @@ void UartUhci::RemountAndRestartDma(bool flush_uart_fifo) {
         mount_configs[i].buffer = buf->data;
         mount_configs[i].length = buf->capacity;
         mount_configs[i].flags.mark_eof = 1;    // Trigger callback when this buffer is filled
-        mount_configs[i].flags.mark_final = 0;  // Continue to next buffer (circular)
     }
 
     last_rx_buf_idx_ = -1;  // Reset buffer sequence tracking
