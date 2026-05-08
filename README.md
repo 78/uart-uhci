@@ -1,40 +1,40 @@
 # uart-uhci
 
-基于 ESP32 UHCI + GDMA 的 UART DMA 接收控制器组件。使用预分配缓冲区池和 GDMA owner 机制实现持续接收，支持按需启动/停止 DMA 以配合低功耗（如释放 PM 锁）。
+A UART DMA receive controller component for ESP32, built on UHCI + GDMA. It uses a preallocated buffer pool together with the GDMA owner mechanism to provide continuous reception, and supports starting/stopping DMA on demand so the system can release its PM lock and enter low-power modes.
 
-## 特性
+## Features
 
-- **UHCI + GDMA**：通过 UHCI 控制器将 UART 与 GDMA 连接，实现 DMA 接收
-- **缓冲区池**：预分配多块 DMA 缓冲区，每块填满或 UART 空闲时触发回调
-- **Idle EOF**：使用 UHCI 空闲 EOF 模式，在 UART 线空闲时结束当前 DMA 传输
-- **Owner 机制**：通过 GDMA 描述符 owner 管理缓冲区归属，用户处理完后调用 `ReturnBuffer` 归还，DMA 自动继续使用
-- **溢出恢复**：当所有缓冲区被 CPU 占用时 DMA 暂停并触发 `OverflowCallback`，全部归还后可自动重新挂载并恢复
-- **PM 锁**：接收期间持有 PM 锁（若启用 `CONFIG_PM_ENABLE`），停止接收时释放，便于配合 light sleep
-- **发送**：TX 使用标准 UART FIFO 同步写入（不占用额外 GDMA 通道）
+- **UHCI + GDMA**: bridges UART with GDMA through the UHCI controller for DMA-based reception.
+- **Buffer pool**: preallocates multiple DMA buffers; a callback is invoked whenever a buffer is filled or the UART line goes idle.
+- **Idle EOF**: uses UHCI's idle EOF mode to terminate the current DMA transfer when the UART line becomes idle.
+- **Owner mechanism**: the GDMA descriptor owner field is used to track buffer ownership. After the user processes a buffer, calling `ReturnBuffer` hands it back to the DMA, which keeps consuming the rest of the pool automatically.
+- **Overflow recovery**: when every buffer is held by the CPU, the DMA pauses and `OverflowCallback` is fired. Once all buffers have been returned, the component flushes the UART RX FIFO, re-mounts the buffers and resumes reception.
+- **PM lock**: a PM lock is held during `StartReceive` and `Transmit` (when `CONFIG_PM_ENABLE` is on) and released by `StopReceive` and at the end of `Transmit`, which plays well with light sleep.
+- **Transmit**: TX is done with synchronous UART FIFO writes, so no extra GDMA channel is needed for sending.
 
-## 依赖
+## Requirements
 
 - ESP-IDF >= 5.5.2
-- 依赖组件：`esp_pm`、`esp_mm`、`esp_driver_uart`
+- Component dependencies: `esp_pm`, `esp_mm`, `esp_driver_uart`
 
-## 配置结构
+## Configuration
 
 ```c
-// 缓冲区池配置
+// Buffer pool configuration
 BufferPoolConfig rx_pool;
-rx_pool.buffer_count = 4;   // 至少 2，建议 4 及以上
-rx_pool.buffer_size  = 256; // 每块缓冲区字节数
+rx_pool.buffer_count = 4;   // At least 2; 4 or more is recommended
+rx_pool.buffer_size  = 256; // Bytes per buffer
 
-// 总配置
+// Top-level configuration
 UartUhci::Config config = {};
 config.uart_port      = UART_NUM_1;
-config.dma_burst_size = 16;  // 或 0 使用默认
+config.dma_burst_size = 16;  // Or 0 to use the default
 config.rx_pool        = rx_pool;
 ```
 
-## 基本用法
+## Basic usage
 
-1. **创建并初始化**
+1. **Create and initialize**
 
 ```cpp
 UartUhci uhci;
@@ -46,54 +46,63 @@ config.rx_pool        = { .buffer_count = 4, .buffer_size = 256 };
 esp_err_t err = uhci.Init(config);
 ```
 
-2. **注册回调（必须在 StartReceive 之前）**
+2. **Register callbacks (must happen before `StartReceive`)**
 
 ```cpp
-// 每块缓冲区接收完成时调用（在 ISR 上下文，需尽快返回）
+// Invoked whenever a buffer is completed (ISR context, return quickly)
 bool on_rx(const UartUhci::RxEventData& data, void* user_data) {
-    // 使用 data.buffer->data, data.recv_size 处理数据
-    // 处理完后必须归还：
+    // Process the data via data.buffer->data and data.recv_size.
+    // The buffer MUST be returned to the pool when you are done with it:
     uhci.ReturnBuffer(data.buffer);
-    return false; // true 表示需要 yield
+    return false; // Return true to request a yield
 }
 uhci.SetRxCallback(on_rx, nullptr);
 
-// 可选：缓冲区耗尽导致 DMA 暂停时调用
-void on_overflow(void* user_data) {
-    // 尽快处理并归还缓冲区，或记录溢出
+// Optional: invoked when DMA pauses because the buffer pool is exhausted (ISR context)
+bool on_overflow(void* user_data) {
+    // Return outstanding buffers as quickly as possible, or simply record the event
+    return false; // Return true to request a yield
 }
 uhci.SetOverflowCallback(on_overflow, nullptr);
 ```
 
-3. **启动/停止接收**
+3. **Start / stop reception**
 
 ```cpp
-uhci.StartReceive();  // 开始 DMA 接收，持有 PM 锁
+uhci.StartReceive();  // Starts DMA reception and acquires the PM lock
 // ...
-uhci.StopReceive();   // 停止 DMA，释放 PM 锁
+uhci.StopReceive();   // Stops DMA and releases the PM lock
 ```
 
-4. **发送数据**
+4. **Transmit data**
 
 ```cpp
 uint8_t msg[] = "hello";
 uhci.Transmit(msg, sizeof(msg) - 1);
 ```
 
-5. **反初始化**
+5. **Status queries**
+
+```cpp
+bool running   = uhci.IsReceiving();           // Whether reception is active
+bool overflow  = uhci.HasOverflow();           // Whether an overflow is currently latched (does not clear)
+bool was_over  = uhci.CheckAndClearOverflow(); // Reads and clears the overflow flag
+```
+
+6. **Deinitialize**
 
 ```cpp
 uhci.Deinit();
 ```
 
-## 注意事项
+## Notes
 
-- **缓冲区数量**：`buffer_count` 至少为 2；过小在数据处理稍慢时容易触发溢出（所有缓冲区被 CPU 占用，DMA 暂停）。
-- **回调上下文**：`RxCallback` 与 `OverflowCallback` 在 ISR 中执行，应避免阻塞和复杂逻辑，处理完后尽快 `ReturnBuffer`。
-- **必须归还**：每块通过 `RxCallback` 拿到的缓冲区都必须调用 `ReturnBuffer(buffer)`，否则会导致缓冲区耗尽和 DMA 暂停。
-- **溢出恢复**：发生溢出后，当所有缓冲区都被归还时，组件会清空 UART RX FIFO 并重新挂载 DMA，无需额外调用。
-- **UART 初始化**：波特率、引脚等需在外部用 `uart_driver_install` / 驱动接口先配置好；本组件只负责 UHCI/GDMA 接收与发送数据到已有 UART。
+- **Pool size**: `buffer_count` must be at least 2. A small pool makes overflow easy to hit when the consumer is slightly slow (all buffers are held by the CPU and the DMA pauses).
+- **Callback context**: both `RxCallback` and `OverflowCallback` run inside an ISR, so avoid blocking or heavy logic and return the buffer via `ReturnBuffer` as soon as possible.
+- **Always return buffers**: every buffer delivered via `RxCallback` must be released with `ReturnBuffer(buffer)`, otherwise the pool will eventually be exhausted and the DMA will stop.
+- **Overflow recovery**: after an overflow, once every buffer has been returned, the component flushes the UART RX FIFO and re-mounts the DMA buffers automatically; no extra call is required.
+- **UART setup**: the baud rate, pin assignment, and other UART parameters must be configured beforehand through `uart_driver_install` or the equivalent driver API. This component only handles UHCI/GDMA reception and writes TX data into an already configured UART.
 
-## 许可证
+## License
 
 Apache-2.0
