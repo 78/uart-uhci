@@ -13,6 +13,7 @@
 #include "esp_attr.h"
 #include "esp_cache.h"
 #include "esp_rom_sys.h"
+#include "esp_idf_version.h"
 #include "esp_heap_caps.h"
 #include "esp_private/gdma.h"
 #include "esp_private/gdma_link.h"
@@ -170,8 +171,12 @@ esp_err_t UartUhci::InitGdma(const Config& config) {
 
     // Allocate RX DMA channel
     gdma_channel_alloc_config_t rx_alloc = {};
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(6, 0, 0)
+    ESP_RETURN_ON_ERROR(gdma_new_ahb_channel(&rx_alloc, nullptr, &rx_dma_chan_), kTag, "RX DMA alloc failed");
+#else
     rx_alloc.direction = GDMA_CHANNEL_DIRECTION_RX;
     ESP_RETURN_ON_ERROR(gdma_new_ahb_channel(&rx_alloc, &rx_dma_chan_), kTag, "RX DMA alloc failed");
+#endif
     gdma_connect(rx_dma_chan_, GDMA_MAKE_TRIGGER(GDMA_TRIG_PERIPH_UHCI, 0));
 
     gdma_transfer_config_t transfer_cfg = {};

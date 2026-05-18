@@ -7,4 +7,6 @@ idf_component_register(
         esp_pm
         esp_mm
         esp_driver_uart
+    PRIV_REQUIRES
+        esp_driver_dma
 )
