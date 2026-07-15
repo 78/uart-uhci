@@ -1,5 +1,5 @@
 dependencies:
-  idf: '>=5.5.2'
+  idf: '>=6.0.1'
 files:
   exclude:
   - .git
