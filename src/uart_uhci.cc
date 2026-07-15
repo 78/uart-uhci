@@ -25,6 +25,13 @@
 
 static const char* kTag = "UartUhci";
 
+// ESP-IDF 6.2 removed SOC_UHCI_NUM from soc/soc_caps.h; the UHCI controller
+// count now lives in hal/uhci_ll.h as UHCI_LL_NUM. Keep backward compatibility
+// with ESP-IDF 6.0/6.1 where only SOC_UHCI_NUM is defined.
+#ifndef SOC_UHCI_NUM
+#define SOC_UHCI_NUM UHCI_LL_NUM
+#endif
+
 // Alignment helper macros
 #define ALIGN_UP(num, align) (((num) + ((align) - 1)) & ~((align) - 1))
 #define MAX_OF(a, b) (((a) > (b)) ? (a) : (b))
