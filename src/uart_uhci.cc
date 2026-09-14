@@ -32,6 +32,15 @@ static const char* kTag = "UartUhci";
 #define SOC_UHCI_NUM UHCI_LL_NUM
 #endif
 
+// see CMakeLists.txt for more info
+static inline void uhci_enable_idle_eof_mode(uhci_dev_t* dev) {
+#if UART_UHCI_LL_HAS_ENABLE_EOF_MODES
+    uhci_ll_rx_enable_eof_modes(dev, UHCI_RX_IDLE_EOF, true);
+#else
+    uhci_ll_rx_set_eof_mode(dev, UHCI_RX_IDLE_EOF);
+#endif
+}
+
 // Alignment helper macros
 #define ALIGN_UP(num, align) (((num) + ((align) - 1)) & ~((align) - 1))
 #define MAX_OF(a, b) (((a) > (b)) ? (a) : (b))
@@ -109,7 +118,7 @@ esp_err_t UartUhci::Init(const Config& config) {
     }
 
     // Enable idle EOF mode - triggers callback when UART line becomes idle
-    uhci_ll_rx_set_eof_mode(uhci_dev_, UHCI_RX_IDLE_EOF);
+    uhci_enable_idle_eof_mode(uhci_dev_);
 
     // Create PM lock
 #if CONFIG_PM_ENABLE
