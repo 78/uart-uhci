@@ -35,6 +35,9 @@ public:
         size_t capacity;        // Buffer capacity / 缓冲区容量
         size_t size;            // Actual received data size / 实际接收数据大小
         uint32_t index;         // Buffer index in pool / 缓冲区在池中的索引
+        // Protected by the controller's RX lock, independently of DMA owner.
+        bool delivered;
+        bool deferred_return;
     };
 
     // RX event data passed to callback
@@ -105,6 +108,10 @@ public:
     // 必须对每个通过 RxCallback 收到的缓冲区调用
     void ReturnBuffer(RxBuffer* buffer);
 
+    // ISR-safe fallback when a consumer queue is full. Reclaim in task context.
+    void DeferReturnBuffer(RxBuffer* buffer);
+    void ReclaimDeferredBuffers();
+
     // Check if RX is currently running
     // 检查 RX 是否正在运行
     bool IsReceiving() const { return rx_running_.load(); }
@@ -119,9 +126,10 @@ public:
     // 检查是否发生溢出（不清除）
     bool HasOverflow() const { return buffer_overflow_.load(); }
 
-    // Transmit data (blocking until FIFO is written)
+    // Transmit with a total FIFO/drain deadline; cancellation releases the PM lock.
     // 通过 FIFO 发送数据（同步阻塞）
-    esp_err_t Transmit(const uint8_t* buffer, size_t size);
+    esp_err_t Transmit(const uint8_t* buffer, size_t size, uint32_t timeout_ms = 1000,
+                       const std::atomic<bool>* cancelled = nullptr);
 
 private:
     // Initialize GDMA channels
@@ -135,6 +143,8 @@ private:
     // Re-mount all buffers and restart DMA (used for initial start and overflow recovery)
     // flush_uart_fifo: if true, flush UART RX FIFO before restarting (for overflow recovery)
     void RemountAndRestartDma(bool flush_uart_fifo = false);
+    bool HasOutstandingBuffers() const;  // RX lock must be held
+    void RecoverOverflow();  // RX lock must be held
 
 public:
     // Handle GDMA RX done callback (called from ISR)
@@ -167,6 +177,7 @@ private:
     size_t rx_ext_mem_align_{0};
     std::atomic<bool> rx_running_{false};
     std::atomic<bool> buffer_overflow_{false};  // Set when DMA stops due to buffer exhaustion
+    portMUX_TYPE rx_lock_ = portMUX_INITIALIZER_UNLOCKED;
 
     // PM lock
     esp_pm_lock_handle_t pm_lock_{nullptr};

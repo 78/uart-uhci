@@ -7,12 +7,12 @@
 #include "uart_uhci.h"
 
 #include <cstring>
-#include <vector>
 #include "esp_log.h"
 #include "esp_check.h"
 #include "esp_attr.h"
 #include "esp_cache.h"
 #include "esp_rom_sys.h"
+#include "esp_timer.h"
 #include "esp_idf_version.h"
 #include "esp_heap_caps.h"
 #include "esp_private/gdma.h"
@@ -186,6 +186,8 @@ esp_err_t UartUhci::InitGdma(const Config& config) {
     // Standard UART FIFO writing will be used in Transmit().
 
     // Allocate RX DMA channel
+    // Keep cache-safe interrupts disabled: gdma_link_* helpers are flash
+    // resident. RX callbacks are deferred by IDF while the cache is disabled.
     gdma_channel_alloc_config_t rx_alloc = {};
 #if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(6, 0, 0)
     ESP_RETURN_ON_ERROR(gdma_new_ahb_channel(&rx_alloc, nullptr, &rx_dma_chan_), kTag, "RX DMA alloc failed");
@@ -312,235 +314,200 @@ void UartUhci::RemountAndRestartDma(bool flush_uart_fifo) {
         uart_ll_rxfifo_rst(hw);
     }
     
-    std::vector<gdma_buffer_mount_config_t> mount_configs(rx_pool_size_);
+    // Called with rx_lock_ held and no consumer leases outstanding. Mount
+    // one descriptor at a time: overflow recovery must never allocate in ISR.
     for (size_t i = 0; i < rx_pool_size_; i++) {
         RxBuffer* buf = &rx_buffer_pool_[i];
         buf->size = 0;
-
-        mount_configs[i].buffer = buf->data;
-        mount_configs[i].length = buf->capacity;
-        mount_configs[i].flags.mark_eof = 1;    // Trigger callback when this buffer is filled
+        gdma_buffer_mount_config_t mount = {};
+        mount.buffer = buf->data;
+        mount.length = buf->capacity;
+        mount.flags.mark_eof = 1;
+        gdma_link_mount_buffers(rx_dma_link_, i, &mount, 1, nullptr);
     }
+    last_rx_buf_idx_ = -1;
 
-    last_rx_buf_idx_ = -1;  // Reset buffer sequence tracking
-
-    // Mount all buffers and start DMA
-    // Owner is set to DMA for all nodes by gdma_link_mount_buffers
-    gdma_link_mount_buffers(rx_dma_link_, 0, mount_configs.data(), rx_pool_size_, nullptr);
-    
     gdma_reset(rx_dma_chan_);
     gdma_start(rx_dma_chan_, rx_dma_link_head_addr_);
 }
 
-esp_err_t UartUhci::StartReceive() {
-    ESP_RETURN_ON_FALSE(!rx_running_.load(), ESP_ERR_INVALID_STATE, kTag, "RX already running");
-    ESP_RETURN_ON_FALSE(rx_buffer_pool_, ESP_ERR_INVALID_STATE, kTag, "buffer pool not initialized");
-    ESP_RETURN_ON_FALSE(rx_pool_size_ >= 2, ESP_ERR_INVALID_STATE, kTag, "need at least 2 buffers");
-
-    // Acquire PM lock
-    if (pm_lock_) {
-        esp_pm_lock_acquire(pm_lock_);
+bool UartUhci::HasOutstandingBuffers() const {
+    for (size_t i = 0; i < rx_pool_size_; ++i) {
+        if (rx_buffer_pool_[i].delivered) return true;
     }
+    return false;
+}
 
+esp_err_t UartUhci::StartReceive() {
+    ESP_RETURN_ON_FALSE(rx_buffer_pool_, ESP_ERR_INVALID_STATE, kTag, "buffer pool not initialized");
+    // Start/Stop are task-context lifecycle operations, serialized by caller.
+    if (pm_lock_) esp_pm_lock_acquire(pm_lock_);
+    portENTER_CRITICAL_SAFE(&rx_lock_);
+    if (rx_running_.load() || HasOutstandingBuffers()) {
+        portEXIT_CRITICAL_SAFE(&rx_lock_);
+        if (pm_lock_) esp_pm_lock_release(pm_lock_);
+        return ESP_ERR_INVALID_STATE;
+    }
+    buffer_overflow_.store(false);
     rx_running_.store(true);
-    buffer_overflow_.store(false);  // Clear overflow flag
-
-    // Mount all buffers and start DMA
     RemountAndRestartDma();
-
-    ESP_LOGD(kTag, "RX started with %d buffers", rx_pool_size_);
+    portEXIT_CRITICAL_SAFE(&rx_lock_);
     return ESP_OK;
 }
 
 esp_err_t UartUhci::StopReceive() {
-    if (!rx_running_.load()) {
-        return ESP_OK;  // Already stopped
+    portENTER_CRITICAL_SAFE(&rx_lock_);
+    if (!rx_running_.exchange(false)) {
+        portEXIT_CRITICAL_SAFE(&rx_lock_);
+        return ESP_OK;
     }
-
-    // Stop and reset DMA
     gdma_stop(rx_dma_chan_);
     gdma_reset(rx_dma_chan_);
-
-    rx_running_.store(false);
-
-    // Release PM lock
-    if (pm_lock_) {
-        esp_pm_lock_release(pm_lock_);
-    }
-
-    // All buffers are now available (no queue operations needed)
-    ESP_LOGD(kTag, "RX stopped");
+    // Consumer leases survive StopReceive. StartReceive refuses to remount
+    // until every queued/processing buffer has been returned.
+    portEXIT_CRITICAL_SAFE(&rx_lock_);
+    if (pm_lock_) esp_pm_lock_release(pm_lock_);
     return ESP_OK;
 }
 
 void UartUhci::ReturnBuffer(RxBuffer* buffer) {
-    if (!buffer || buffer->index >= rx_pool_size_) {
+    portENTER_CRITICAL_SAFE(&rx_lock_);
+    if (!buffer || buffer->index >= rx_pool_size_ ||
+        buffer != &rx_buffer_pool_[buffer->index] || !buffer->delivered) {
+        portEXIT_CRITICAL_SAFE(&rx_lock_);
         return;
     }
-
     buffer->size = 0;
-    
-    // Set the corresponding DMA node owner back to DMA
+    buffer->deferred_return = false;
+    // Publish DMA ownership and release the consumer lease under the same
+    // lock used by the ISR, so no scan observes a half-returned descriptor.
     gdma_link_set_owner(rx_dma_link_, buffer->index, GDMA_LLI_OWNER_DMA);
-    
-    // Resume DMA if it was paused waiting for available buffers
+    buffer->delivered = false;
     if (rx_running_.load()) {
         if (buffer_overflow_.load()) {
-            // In overflow state - check if ALL buffers are now returned before resuming
-            bool all_returned = true;
-            for (size_t i = 0; i < rx_pool_size_; i++) {
-                gdma_lli_owner_t owner;
-                if (gdma_link_get_owner(rx_dma_link_, i, &owner) == ESP_OK && owner == GDMA_LLI_OWNER_CPU) {
-                    all_returned = false;
-                    break;
-                }
-            }
-            
-            if (all_returned) {
-                // All buffers returned, safe to resume DMA
-                buffer_overflow_.store(false);
-                
-                // Re-mount all buffers and restart DMA
-                // Flush UART FIFO to discard stale/incomplete data from overflow period
-                RemountAndRestartDma(true);
-            }
-            // If not all returned, don't call gdma_append - wait for more buffers
+            RecoverOverflow();
         } else {
-            // Normal operation - just append to resume DMA
             gdma_append(rx_dma_chan_);
         }
     }
+    portEXIT_CRITICAL_SAFE(&rx_lock_);
 }
 
-esp_err_t UartUhci::Transmit(const uint8_t* buffer, size_t size) {
-    ESP_RETURN_ON_FALSE(buffer && size > 0, ESP_ERR_INVALID_ARG, kTag, "invalid arguments");
-
-    // Acquire PM lock for TX
-    if (pm_lock_) {
-        esp_pm_lock_acquire(pm_lock_);
+void UartUhci::RecoverOverflow() {
+    if (!rx_running_.load() || !buffer_overflow_.load() || HasOutstandingBuffers()) return;
+    for (size_t i = 0; i < rx_pool_size_; ++i) {
+        gdma_lli_owner_t owner;
+        if (gdma_link_get_owner(rx_dma_link_, i, &owner) != ESP_OK ||
+            owner != GDMA_LLI_OWNER_DMA) return;
     }
+    buffer_overflow_.store(false);
+    RemountAndRestartDma(true);
+}
 
-    // Standard UART FIFO writing (Synchronous)
-    uart_dev_t *hw = UART_LL_GET_HW(uart_port_);
+void UartUhci::DeferReturnBuffer(RxBuffer* buffer) {
+    portENTER_CRITICAL_SAFE(&rx_lock_);
+    if (buffer && buffer->index < rx_pool_size_ &&
+        buffer == &rx_buffer_pool_[buffer->index] && buffer->delivered) {
+        buffer->deferred_return = true;
+    }
+    portEXIT_CRITICAL_SAFE(&rx_lock_);
+}
+
+void UartUhci::ReclaimDeferredBuffers() {
+    for (size_t i = 0; i < rx_pool_size_; ++i) {
+        portENTER_CRITICAL_SAFE(&rx_lock_);
+        if (rx_buffer_pool_[i].deferred_return) ReturnBuffer(&rx_buffer_pool_[i]);
+        portEXIT_CRITICAL_SAFE(&rx_lock_);
+    }
+}
+
+esp_err_t UartUhci::Transmit(const uint8_t* buffer, size_t size, uint32_t timeout_ms,
+                            const std::atomic<bool>* cancelled) {
+    ESP_RETURN_ON_FALSE(buffer && size > 0, ESP_ERR_INVALID_ARG, kTag, "invalid arguments");
+    const int64_t deadline = esp_timer_get_time() + static_cast<int64_t>(timeout_ms) * 1000;
+    if (pm_lock_) esp_pm_lock_acquire(pm_lock_);
+    uart_dev_t* hw = UART_LL_GET_HW(uart_port_);
     const uint8_t* data = buffer;
     size_t remaining = size;
-
-    while (remaining > 0) {
-        uint32_t can_write = uart_ll_get_txfifo_len(hw);
-        uint32_t to_write = (remaining < can_write) ? (uint32_t)remaining : can_write;
-        if (to_write > 0) {
-            uart_ll_write_txfifo(hw, data, to_write);
-            data += to_write;
-            remaining -= to_write;
+    esp_err_t ret = ESP_OK;
+    // The same deadline covers filling FIFO and waiting for the final byte.
+    while (remaining > 0 || !uart_ll_is_tx_idle(hw)) {
+        if (cancelled && cancelled->load()) {
+            ret = ESP_ERR_INVALID_STATE;
+            break;
+        }
+        if (esp_timer_get_time() >= deadline) {
+            ret = ESP_ERR_TIMEOUT;
+            break;
+        }
+        const size_t available = uart_ll_get_txfifo_len(hw);
+        const size_t count = remaining < available ? remaining : available;
+        if (count) {
+            uart_ll_write_txfifo(hw, data, count);
+            data += count;
+            remaining -= count;
         } else {
-            esp_rom_delay_us(10); 
+            esp_rom_delay_us(10);
         }
     }
-
-    // Wait for the last bytes to actually be sent out
-    while (!uart_ll_is_tx_idle(hw)) {
-        esp_rom_delay_us(10);
+    if (ret != ESP_OK) {
+        // A cancelled/partial frame must not remain queued in the UART FIFO.
+        uart_ll_txfifo_rst(hw);
     }
-
-    // Release PM lock
-    if (pm_lock_) {
-        esp_pm_lock_release(pm_lock_);
-    }
-
-    return ESP_OK;
+    if (pm_lock_) esp_pm_lock_release(pm_lock_);
+    return ret;
 }
 
 bool UartUhci::HandleGdmaRxDone(uintptr_t desc_addr, bool is_normal_eof) {
+    portENTER_CRITICAL_SAFE(&rx_lock_);
     if (!rx_running_.load()) {
+        portEXIT_CRITICAL_SAFE(&rx_lock_);
         return false;
     }
-
-    // In UHCI idle EOF mode, multiple buffers may complete nearly simultaneously
-    // but only one callback may be triggered. We need to check ALL buffers
-    // and process any that have owner=CPU (completed by DMA).
-    
-    // Track maximum CPU-owned buffers for debugging
-    static int max_cpu_owned = 0;
-    int cpu_owned = 0;
-    for (size_t i = 0; i < rx_pool_size_; i++) {
-        gdma_lli_owner_t owner;
-        if (gdma_link_get_owner(rx_dma_link_, i, &owner) == ESP_OK && owner == GDMA_LLI_OWNER_CPU) {
-            cpu_owned++;
-        }
-    }
-    if (cpu_owned > max_cpu_owned) {
-        max_cpu_owned = cpu_owned;
-        ESP_DRAM_LOGI(kTag, "New max CPU-owned buffers: %d/%d", max_cpu_owned, rx_pool_size_);
-    }
-    
     bool need_yield = false;
-    
-    // Process all completed buffers in order, starting from expected next buffer
-    int start_idx = (last_rx_buf_idx_ + 1) % rx_pool_size_;
-    
-    for (size_t count = 0; count < rx_pool_size_; count++) {
-        int buf_idx = (start_idx + count) % rx_pool_size_;
-        
-        // Check if this buffer has been completed by DMA (owner = CPU)
-        gdma_lli_owner_t owner;
-        if (gdma_link_get_owner(rx_dma_link_, buf_idx, &owner) != ESP_OK) {
-            continue;
-        }
-        
-        if (owner != GDMA_LLI_OWNER_CPU) {
-            // Buffer not completed yet, stop scanning
-            // (DMA processes buffers in order, so if this one isn't done, 
-            // later ones won't be either)
-            break;
-        }
-        
+    const int start_idx = (last_rx_buf_idx_ + 1) % rx_pool_size_;
+    for (size_t count = 0; count < rx_pool_size_; ++count) {
+        const int buf_idx = (start_idx + count) % rx_pool_size_;
         RxBuffer* buf = &rx_buffer_pool_[buf_idx];
-        
-        // Get received size from the DMA descriptor
-        size_t rx_size = gdma_link_get_length(rx_dma_link_, buf_idx);
-        
-        // Sanity check
+        // CPU owner alone also describes a buffer already queued to a
+        // consumer. Skip those leases when the ring wraps around.
+        if (buf->delivered) continue;
+        gdma_lli_owner_t owner;
+        if (gdma_link_get_owner(rx_dma_link_, buf_idx, &owner) != ESP_OK) continue;
+        if (owner != GDMA_LLI_OWNER_CPU) break;
+
+        const size_t rx_size = gdma_link_get_length(rx_dma_link_, buf_idx);
+        last_rx_buf_idx_ = buf_idx;
         if (rx_size == 0 || rx_size > buf->capacity) {
-            // Invalid size, set owner back to DMA and continue
-            ESP_DRAM_LOGW(kTag, "buf[%d] invalid rx_size=%u (last=%d, start=%d)", 
-                          buf_idx, rx_size, last_rx_buf_idx_, start_idx);
             gdma_link_set_owner(rx_dma_link_, buf_idx, GDMA_LLI_OWNER_DMA);
-            gdma_append(rx_dma_chan_);
-            last_rx_buf_idx_ = buf_idx;
+            if (!buffer_overflow_.load()) gdma_append(rx_dma_chan_);
             continue;
         }
-        
         buf->size = rx_size;
-
-        // Sync cache if needed
         if (rx_cache_line_ > 0) {
-            size_t sync_size = ALIGN_UP(rx_size, rx_cache_line_);
-            esp_cache_msync(buf->data, sync_size, ESP_CACHE_MSYNC_FLAG_DIR_M2C);
+            esp_cache_msync(buf->data, ALIGN_UP(rx_size, rx_cache_line_),
+                            ESP_CACHE_MSYNC_FLAG_DIR_M2C);
         }
-
-        // Update last processed buffer index
-        last_rx_buf_idx_ = buf_idx;
-
-        // Deliver buffer to user via callback
+        // Mark before callback, including callbacks which return immediately.
+        buf->delivered = true;
         if (rx_callback_) {
-            RxEventData data = {
-                .buffer = buf,
-                .recv_size = rx_size,
-            };
-            if (rx_callback_(data, rx_callback_user_data_)) {
-                need_yield = true;
-            }
+            RxEventData data = {.buffer = buf, .recv_size = rx_size};
+            need_yield |= rx_callback_(data, rx_callback_user_data_);
         } else {
-            // No callback registered, return buffer immediately
-            gdma_link_set_owner(rx_dma_link_, buf_idx, GDMA_LLI_OWNER_DMA);
+            ReturnBuffer(buf);
         }
     }
-
+    // Also recover when an error interrupt arrives after the last return, or
+    // all completed descriptors were invalid and recycled without a callback.
+    RecoverOverflow();
+    portEXIT_CRITICAL_SAFE(&rx_lock_);
     return need_yield;
 }
 
 bool UartUhci::HandleGdmaDescrErr() {
+    portENTER_CRITICAL_SAFE(&rx_lock_);
     if (!rx_running_.load()) {
+        portEXIT_CRITICAL_SAFE(&rx_lock_);
         return false;
     }
 
@@ -548,25 +515,12 @@ bool UartUhci::HandleGdmaDescrErr() {
     bool expected = false;
     if (!buffer_overflow_.compare_exchange_strong(expected, true)) {
         // Already in overflow state, ignore repeated triggers
+        portEXIT_CRITICAL_SAFE(&rx_lock_);
         return false;
     }
 
-    // Count how many buffers are owned by CPU (exhausted)
-    int cpu_owned = 0;
-    for (size_t i = 0; i < rx_pool_size_; i++) {
-        gdma_lli_owner_t owner;
-        if (gdma_link_get_owner(rx_dma_link_, i, &owner) == ESP_OK && owner == GDMA_LLI_OWNER_CPU) {
-            cpu_owned++;
-        }
-    }
-
-    // Log warning: DMA stopped due to buffer exhaustion (owner check failed)
-    // This happens when all buffers are held by CPU and DMA has no buffer to write to
-    ESP_DRAM_LOGW(kTag, "GDMA descr_err: buffer exhaustion, %d/%d buffers held by CPU. "
-                  "DMA paused until buffers are returned.", cpu_owned, rx_pool_size_);
-
-    // Don't call gdma_append here - it will be called in ReturnBuffer when buffers are freed
-    // Calling it here would cause repeated descr_err triggers since no buffers are available
+    // Keep ISR recovery allocation-free and avoid formatting logs while the
+    // RX lock is held. HasOverflow/OverflowCallback expose the condition.
 
     // Notify upper layer via callback (only once)
     bool need_yield = false;
@@ -574,5 +528,9 @@ bool UartUhci::HandleGdmaDescrErr() {
         need_yield = overflow_callback_(overflow_callback_user_data_);
     }
 
+    // Also recover when an error interrupt arrives after the last return, or
+    // all completed descriptors were invalid and recycled without a callback.
+    RecoverOverflow();
+    portEXIT_CRITICAL_SAFE(&rx_lock_);
     return need_yield;
 }

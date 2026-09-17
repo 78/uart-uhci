@@ -40,6 +40,7 @@ idf_component_register(
         esp_mm
         esp_driver_uart
     PRIV_REQUIRES
+        esp_timer
         ${UART_UHCI_DMA_COMPONENT}
 )
 

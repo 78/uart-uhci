@@ -7,15 +7,19 @@
 - **UHCI + GDMA**：通过 UHCI 控制器将 UART 与 GDMA 连接，实现 DMA 接收
 - **缓冲区池**：预分配多块 DMA 缓冲区，每块填满或 UART 空闲时触发回调
 - **Idle EOF**：使用 UHCI 空闲 EOF 模式，在 UART 线空闲时结束当前 DMA 传输
-- **Owner 机制**：通过 GDMA 描述符 owner 管理缓冲区归属，用户处理完后调用 `ReturnBuffer` 归还，DMA 自动继续使用
+- **所有权**：GDMA owner 表示 DMA 是否完成；独立的消费者持有状态防止同一缓冲重复回调。`ReturnBuffer` 在 RX 锁内释放持有状态并归还 DMA。
 - **溢出恢复**：当所有缓冲区被 CPU 占用时 DMA 暂停并触发 `OverflowCallback`，全部归还后自动清空 UART RX FIFO 并重新挂载缓冲区恢复接收
 - **PM 锁**：在 `StartReceive` 与 `Transmit` 期间持有 PM 锁（若启用 `CONFIG_PM_ENABLE`），`StopReceive` 与 `Transmit` 完成后释放，便于配合 light sleep
-- **发送**：TX 使用标准 UART FIFO 同步写入（不占用额外 GDMA 通道）
+- **发送**：TX 使用标准 UART FIFO 同步写入（不占用额外 GDMA 通道）；`Transmit` 默认 1000 ms 总期限覆盖 FIFO 写入和末字节发完，可传入原子取消标志。超时/取消清空残留 TX FIFO 并释放 PM 锁，已经发出的部分字节无法撤回。
 
 ## 依赖
 
 - ESP-IDF >= 5.5.2
-- 依赖组件：`esp_pm`、`esp_mm`、`esp_driver_uart`
+- 依赖组件：`esp_pm`、`esp_mm`、`esp_driver_uart`，内部计时使用 `esp_timer`
+
+## 变更日志
+
+版本变更与升级注意事项见 [CHANGELOG.md](CHANGELOG.md)。
 
 ## 配置结构
 
@@ -99,6 +103,9 @@ uhci.Deinit();
 
 - **缓冲区数量**：`buffer_count` 至少为 2；过小在数据处理稍慢时容易触发溢出（所有缓冲区被 CPU 占用，DMA 暂停）。
 - **回调上下文**：`RxCallback` 与 `OverflowCallback` 都在 ISR 中执行，应避免阻塞和复杂逻辑，处理完后尽快 `ReturnBuffer`。
+- **停止与重启**：`StopReceive()` 停止 DMA，但不会撤销消费者持有的缓冲。必须全部归还后再 `StartReceive()`（否则返回 `ESP_ERR_INVALID_STATE`）或 `Deinit()`；生命周期操作由调用者串行执行。
+- **队列满处理**：ISR 入队失败时可调用 `DeferReturnBuffer(buffer)`，消费者任务定期及停止 RX 后调用 `ReclaimDeferredBuffers()`，无需再次向已满队列投递回收事件。
+- **ISR 恢复**：重挂 DMA 链表不再动态分配内存。回调在 RX 锁内执行，必须保持短小且不阻塞；支持回调内直接归还缓冲。
 - **必须归还**：每块通过 `RxCallback` 拿到的缓冲区都必须调用 `ReturnBuffer(buffer)`，否则会导致缓冲区耗尽和 DMA 暂停。
 - **溢出恢复**：发生溢出后，当所有缓冲区都被归还时，组件会清空 UART RX FIFO 并重新挂载 DMA，无需额外调用。
 - **UART 初始化**：波特率、引脚等需在外部用 `uart_driver_install` / 驱动接口先配置好；本组件只负责 UHCI/GDMA 接收与发送数据到已有 UART。
@@ -106,3 +113,7 @@ uhci.Deinit();
 ## 许可证
 
 Apache-2.0
+
+## 主机回归测试
+
+运行 `python3 tests/run_host_tests.py`（需要 C++20 编译器）。测试直接编译生产 RX 方法，以模拟 GDMA 环验证所有权并启用 ASan/UBSan；硬件验证边界见 `tests/README.md`。

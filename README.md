@@ -7,15 +7,19 @@ A UART DMA receive controller component for ESP32, built on UHCI + GDMA. It uses
 - **UHCI + GDMA**: bridges UART with GDMA through the UHCI controller for DMA-based reception.
 - **Buffer pool**: preallocates multiple DMA buffers; a callback is invoked whenever a buffer is filled or the UART line goes idle.
 - **Idle EOF**: uses UHCI's idle EOF mode to terminate the current DMA transfer when the UART line becomes idle.
-- **Owner mechanism**: the GDMA descriptor owner field is used to track buffer ownership. After the user processes a buffer, calling `ReturnBuffer` hands it back to the DMA, which keeps consuming the rest of the pool automatically.
+- **Ownership**: GDMA owner tracks DMA completion; a separate consumer lease prevents repeated callbacks for an outstanding buffer. `ReturnBuffer` releases that lease and returns the descriptor to DMA under the RX lock.
 - **Overflow recovery**: when every buffer is held by the CPU, the DMA pauses and `OverflowCallback` is fired. Once all buffers have been returned, the component flushes the UART RX FIFO, re-mounts the buffers and resumes reception.
 - **PM lock**: a PM lock is held during `StartReceive` and `Transmit` (when `CONFIG_PM_ENABLE` is on) and released by `StopReceive` and at the end of `Transmit`, which plays well with light sleep.
-- **Transmit**: TX is done with synchronous UART FIFO writes, so no extra GDMA channel is needed for sending.
+- **Transmit**: TX uses synchronous UART FIFO writes with a total deadline (default 1000 ms), so no extra GDMA channel is needed. An optional atomic cancellation flag interrupts FIFO filling/draining; timeout/cancellation resets the remaining TX FIFO and releases the PM lock. A partially transmitted frame cannot be recalled.
 
 ## Requirements
 
 - ESP-IDF >= 5.5.2
-- Component dependencies: `esp_pm`, `esp_mm`, `esp_driver_uart`
+- Component dependencies: `esp_pm`, `esp_mm`, `esp_driver_uart`; private timing dependency: `esp_timer`
+
+## Changelog
+
+See [CHANGELOG.md](CHANGELOG.md) for version history and upgrade notes.
 
 ## Configuration
 
@@ -99,6 +103,9 @@ uhci.Deinit();
 
 - **Pool size**: `buffer_count` must be at least 2. A small pool makes overflow easy to hit when the consumer is slightly slow (all buffers are held by the CPU and the DMA pauses).
 - **Callback context**: both `RxCallback` and `OverflowCallback` run inside an ISR, so avoid blocking or heavy logic and return the buffer via `ReturnBuffer` as soon as possible.
+- **Stop/restart**: `StopReceive()` stops DMA but preserves consumer leases. Return all outstanding buffers before `StartReceive()` (otherwise it returns `ESP_ERR_INVALID_STATE`) or `Deinit()`. Lifecycle calls must be serialized by the caller.
+- **Queue-full fallback**: an ISR consumer can call `DeferReturnBuffer(buffer)` on failed enqueue. Its task must call `ReclaimDeferredBuffers()` regularly and after stopping RX; the deferred return needs no second queue entry.
+- **ISR recovery**: remounting the DMA ring does not allocate memory. Callbacks run under the RX lock and must remain short/nonblocking; returning a buffer directly from a callback is supported.
 - **Always return buffers**: every buffer delivered via `RxCallback` must be released with `ReturnBuffer(buffer)`, otherwise the pool will eventually be exhausted and the DMA will stop.
 - **Overflow recovery**: after an overflow, once every buffer has been returned, the component flushes the UART RX FIFO and re-mounts the DMA buffers automatically; no extra call is required.
 - **UART setup**: the baud rate, pin assignment, and other UART parameters must be configured beforehand through `uart_driver_install` or the equivalent driver API. This component only handles UHCI/GDMA reception and writes TX data into an already configured UART.
@@ -106,3 +113,7 @@ uhci.Deinit();
 ## License
 
 Apache-2.0
+
+## Host regression tests
+
+Run `python3 tests/run_host_tests.py` with a C++20 compiler. The runner compiles the production RX methods against a fake GDMA ring with ASan/UBSan; see `tests/README.md` for hardware validation limits.
