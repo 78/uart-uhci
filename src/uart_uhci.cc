@@ -202,8 +202,19 @@ esp_err_t UartUhci::InitGdma(const Config& config) {
     transfer_cfg.access_ext_mem = true;
     ESP_RETURN_ON_ERROR(gdma_config_transfer(rx_dma_chan_, &transfer_cfg), kTag, "RX DMA config failed");
 
-    // Get RX alignment constraints
-    gdma_get_alignment_constraints(rx_dma_chan_, &rx_int_mem_align_, &rx_ext_mem_align_);
+    // Get RX alignment constraints. ESP-IDF 6.2 splits external-memory
+    // alignment into encrypted/ECC and unencrypted cases. Use the conservative
+    // encrypted/ECC value to preserve the old API's safe allocation behavior.
+#if UART_UHCI_GDMA_HAS_CHANNEL_ALIGNMENT_INFO
+    gdma_channel_alignment_info_t alignment_info = {};
+    ESP_RETURN_ON_ERROR(gdma_get_channel_alignment_constraints(rx_dma_chan_, &alignment_info),
+                        kTag, "failed to get RX DMA alignment constraints");
+    rx_int_mem_align_ = alignment_info.int_mem_alignment;
+    rx_ext_mem_align_ = alignment_info.ext_enc_mem_alignment;
+#else
+    ESP_RETURN_ON_ERROR(gdma_get_alignment_constraints(rx_dma_chan_, &rx_int_mem_align_, &rx_ext_mem_align_),
+                        kTag, "failed to get RX DMA alignment constraints");
+#endif
 
     // Create RX DMA link list with buffer pool size and owner checking enabled
     // Each buffer gets one DMA node, owner mechanism manages buffer availability

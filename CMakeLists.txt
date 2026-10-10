@@ -30,6 +30,25 @@ if(uart_uhci_ll_contents MATCHES "uhci_ll_rx_enable_eof_modes[ \\t\\r\\n]*\\(")
     set(UART_UHCI_LL_HAS_ENABLE_EOF_MODES 1)
 endif()
 
+# ESP-IDF 6.2 replaced gdma_get_alignment_constraints() with
+# gdma_get_channel_alignment_constraints() and changed the returned alignment
+# data to a structure. Detect the declaration so this component also remains
+# compatible with ESP-IDF 5.5, 6.0, and 6.1.
+if(IDF_VERSION_MAJOR GREATER_EQUAL 6)
+    set(UART_UHCI_GDMA_HEADER "${idf_path}/components/esp_driver_dma/include/esp_private/gdma.h")
+else()
+    set(UART_UHCI_GDMA_HEADER "${idf_path}/components/esp_hw_support/dma/include/esp_private/gdma.h")
+endif()
+
+if(NOT EXISTS "${UART_UHCI_GDMA_HEADER}")
+    message(FATAL_ERROR "uart-uhci: unable to locate esp_private/gdma.h")
+endif()
+
+file(READ "${UART_UHCI_GDMA_HEADER}" uart_uhci_gdma_contents)
+if(uart_uhci_gdma_contents MATCHES "gdma_get_channel_alignment_constraints[ \\t\\r\\n]*\\(")
+    set(UART_UHCI_GDMA_HAS_CHANNEL_ALIGNMENT_INFO 1)
+endif()
+
 idf_component_register(
     SRCS
         "src/uart_uhci.cc"
@@ -46,4 +65,8 @@ idf_component_register(
 
 if(UART_UHCI_LL_HAS_ENABLE_EOF_MODES)
     target_compile_definitions(${COMPONENT_LIB} PRIVATE UART_UHCI_LL_HAS_ENABLE_EOF_MODES=1)
+endif()
+
+if(UART_UHCI_GDMA_HAS_CHANNEL_ALIGNMENT_INFO)
+    target_compile_definitions(${COMPONENT_LIB} PRIVATE UART_UHCI_GDMA_HAS_CHANNEL_ALIGNMENT_INFO=1)
 endif()
