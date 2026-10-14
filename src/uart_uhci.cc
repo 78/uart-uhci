@@ -41,6 +41,30 @@ static inline void uhci_enable_idle_eof_mode(uhci_dev_t* dev) {
 #endif
 }
 
+// Query allocation constraints using the API provided by the selected SDK.
+static esp_err_t uhci_get_alignment_constraints(gdma_channel_handle_t channel,
+                                                size_t* internal_alignment,
+                                                size_t* external_alignment) {
+#if UART_UHCI_GDMA_HAS_CHANNEL_ALIGNMENT
+    gdma_channel_alignment_info_t info = {};
+    esp_err_t ret = gdma_get_channel_alignment_constraints(channel, &info);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+    if (internal_alignment != nullptr) {
+        *internal_alignment = info.int_mem_alignment;
+    }
+    if (external_alignment != nullptr) {
+        // Preserve conservative allocation requirements for encrypted/ECC
+        // external memory; cache-line alignment is handled by the buffer pool.
+        *external_alignment = info.ext_enc_mem_alignment;
+    }
+    return ESP_OK;
+#else
+    return gdma_get_alignment_constraints(channel, internal_alignment, external_alignment);
+#endif
+}
+
 // Alignment helper macros
 #define ALIGN_UP(num, align) (((num) + ((align) - 1)) & ~((align) - 1))
 #define MAX_OF(a, b) (((a) > (b)) ? (a) : (b))
@@ -203,7 +227,9 @@ esp_err_t UartUhci::InitGdma(const Config& config) {
     ESP_RETURN_ON_ERROR(gdma_config_transfer(rx_dma_chan_, &transfer_cfg), kTag, "RX DMA config failed");
 
     // Get RX alignment constraints
-    gdma_get_alignment_constraints(rx_dma_chan_, &rx_int_mem_align_, &rx_ext_mem_align_);
+    ESP_RETURN_ON_ERROR(
+        uhci_get_alignment_constraints(rx_dma_chan_, &rx_int_mem_align_, &rx_ext_mem_align_), kTag,
+        "RX DMA alignment query failed");
 
     // Create RX DMA link list with buffer pool size and owner checking enabled
     // Each buffer gets one DMA node, owner mechanism manages buffer availability

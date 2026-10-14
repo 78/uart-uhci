@@ -30,6 +30,26 @@ if(uart_uhci_ll_contents MATCHES "uhci_ll_rx_enable_eof_modes[ \\t\\r\\n]*\\(")
     set(UART_UHCI_LL_HAS_ENABLE_EOF_MODES 1)
 endif()
 
+# Maintenance branches can replace the GDMA alignment API without changing
+# IDF_VERSION. Probe the declaration just as we do for the UHCI LL API.
+set(UART_UHCI_GDMA_HEADER)
+foreach(gdma_include_dir include dma/include)
+    set(gdma_header "${idf_path}/components/${UART_UHCI_DMA_COMPONENT}/${gdma_include_dir}/esp_private/gdma.h")
+    if(EXISTS "${gdma_header}")
+        set(UART_UHCI_GDMA_HEADER "${gdma_header}")
+        break()
+    endif()
+endforeach()
+if(NOT UART_UHCI_GDMA_HEADER)
+    message(FATAL_ERROR "uart-uhci: unable to locate esp_private/gdma.h")
+endif()
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${UART_UHCI_GDMA_HEADER}")
+file(READ "${UART_UHCI_GDMA_HEADER}" uart_uhci_gdma_contents)
+if(uart_uhci_gdma_contents MATCHES
+        "esp_err_t[ \t\r\n]+gdma_get_channel_alignment_constraints[ \t\r\n]*\\(")
+    set(UART_UHCI_GDMA_HAS_CHANNEL_ALIGNMENT 1)
+endif()
+
 idf_component_register(
     SRCS
         "src/uart_uhci.cc"
@@ -46,4 +66,8 @@ idf_component_register(
 
 if(UART_UHCI_LL_HAS_ENABLE_EOF_MODES)
     target_compile_definitions(${COMPONENT_LIB} PRIVATE UART_UHCI_LL_HAS_ENABLE_EOF_MODES=1)
+endif()
+
+if(UART_UHCI_GDMA_HAS_CHANNEL_ALIGNMENT)
+    target_compile_definitions(${COMPONENT_LIB} PRIVATE UART_UHCI_GDMA_HAS_CHANNEL_ALIGNMENT=1)
 endif()
